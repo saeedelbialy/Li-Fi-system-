@@ -1,0 +1,200 @@
+import RPi.GPIO as GPIO
+import time
+import socket
+import threading
+import base64
+import json
+
+# Laser setup
+laser_pin = 18
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(laser_pin, GPIO.OUT)
+
+# Communication settings
+bit_duration = 0.006  # Bit duration for better accuracy
+HOST = '0.0.0.0'  # Listen on all interfaces
+PORT = 8080       # Port to listen on
+
+def send_bit(bit):
+    GPIO.output(laser_pin, GPIO.HIGH if bit == '1' else GPIO.LOW)
+    time.sleep(bit_duration)
+
+def send_char(char):
+    binary = format(ord(char), '08b')
+
+    send_bit('1')  # Start bit
+    for bit in binary:
+        send_bit(bit)
+    send_bit('0')  # Stop bit
+
+    time.sleep(bit_duration * 0.5)  # Small pause between characters
+
+def send_message(message):
+    # Send start marker '#' before the actual message
+    send_char('#')
+    time.sleep(bit_duration * 2)  # Pause after start marker
+
+    # Send the actual message
+    for char in message:
+        send_char(char)
+
+    # Send end marker '*' after the message
+    time.sleep(bit_duration * 2)  # Pause before end marker
+    send_char('*')
+
+    print(f"Transmitted: #{message}*")
+
+    # Blink twice to indicate transmission complete
+    blink_status(2)
+
+def send_binary_data(data, chunk_size=10000):
+    """Send binary data in chunks with markers"""
+    # Convert binary data to base64 string
+    base64_data = base64.b64encode(data).decode('utf-8')
+
+    # Send data in chunks to avoid overwhelming the receiver
+    for i in range(0, len(base64_data), chunk_size):
+        chunk = base64_data[i:i+chunk_size]
+
+        # Send chunk with appropriate markers
+        if i == 0:  # First chunk
+            send_message(f"IMG_START:{chunk}")
+        elif i + chunk_size >= len(base64_data):  # Last chunk
+            send_message(f"IMG_END:{chunk}")
+        else:  # Middle chunks
+            send_message(f"IMG_CHUNK:{chunk}")
+
+        # Small delay between chunks
+        time.sleep(1)
+
+# Status indicators
+def blink_status(count, delay=0.2):
+    """Blink the laser to indicate status"""
+    for _ in range(count):
+        GPIO.output(laser_pin, GPIO.HIGH)
+        time.sleep(delay)
+        GPIO.output(laser_pin, GPIO.LOW)
+        time.sleep(delay)
+
+def handle_client(conn, addr):
+    print(f"Connected by {addr}")
+    try:
+        buffer = b""
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                break
+
+            buffer += data
+
+            # Try to parse the buffer as JSON
+            try:
+                # Check if we have a complete message (ending with newline)
+                if b'\n' in buffer:
+                    messages = buffer.split(b'\n')
+                    # Process all complete messages
+                    for i in range(len(messages) - 1):
+                        process_message(messages[i], conn)
+                    # Keep the incomplete message in the buffer
+                    buffer = messages[-1]
+            except Exception as e:
+                print(f"Error processing message: {e}")
+    except Exception as e:
+        print(f"Connection error: {e}")
+    finally:
+        conn.close()
+        print(f"Connection with {addr} closed")
+
+def process_message(message_bytes, conn):
+    if not message_bytes:
+        return
+
+    try:
+        message = json.loads(message_bytes.decode('utf-8'))
+        message_type = message.get('type')
+
+        if message_type == 'text':
+            text_content = message.get('content', '')
+            print(f"Received text: {text_content}")
+
+            # Transmit the text using the laser
+            send_message(text_content)
+
+            # Send acknowledgment
+            response = {
+                'type': 'ack',
+                'content': f"Transmitted: #{text_content}*"
+            }
+            conn.sendall((json.dumps(response) + '\n').encode('utf-8'))
+
+        elif message_type == 'image':
+            image_data = message.get('content', '')
+            image_name = message.get('name', f"image_{int(time.time())}.jpg")
+
+            # Decode base64 image
+            try:
+                image_bytes = base64.b64decode(image_data)
+                print(f"Received image: {image_name}, size: {len(image_bytes)} bytes")
+
+                # First send a message indicating an image is coming
+                send_message(f"IMAGE:{image_name}")
+                time.sleep(1)  # Pause before sending the actual image data
+
+                # Send the actual image data
+                send_binary_data(image_bytes)
+
+                # Send acknowledgment
+                response = {
+                    'type': 'ack',
+                    'content': f"Transmitted image: {image_name}"
+                }
+                conn.sendall((json.dumps(response) + '\n').encode('utf-8'))
+
+            except Exception as e:
+                print(f"Error processing image: {e}")
+                response = {
+                    'type': 'error',
+                    'content': f"Failed to process image: {str(e)}"
+                }
+                conn.sendall((json.dumps(response) + '\n').encode('utf-8'))
+        else:
+            print(f"Unknown message type: {message_type}")
+
+    except json.JSONDecodeError as e:
+        print(f"Invalid JSON: {e}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+def start_server():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((HOST, PORT))
+        s.listen()
+        print(f"Transmitter server listening on {HOST}:{PORT}")
+
+        # Blink 3 times to indicate server is ready
+        blink_status(3)
+
+        try:
+            while True:
+                conn, addr = s.accept()
+                client_thread = threading.Thread(target=handle_client, args=(conn, addr))
+                client_thread.daemon = True
+                client_thread.start()
+        except KeyboardInterrupt:
+            print("Server shutting down...")
+        finally:
+            GPIO.cleanup()
+
+if __name__ == "__main__":
+    try:
+        print("LiFi Transmitter starting...")
+        print("Using GPIO pin", laser_pin, "for laser output")
+        print("# will mark the start of transmission")
+        print("* will mark the end of transmission")
+        start_server()
+    except Exception as e:
+        print(f"Server error: {e}")
+    finally:
+        GPIO.cleanup()
+

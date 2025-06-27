@@ -1,0 +1,227 @@
+import RPi.GPIO as GPIO
+import time
+import socket
+import threading
+import json
+import base64
+import logging
+import signal
+import sys
+import string
+
+# Setup logging
+logging.basicConfig(
+    filename='receiver.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Photocell setup
+photocell_pin = 17  # Change this based on your wiring
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(photocell_pin, GPIO.IN)
+
+# Communication settings
+bit_duration = 0.006  # Match transmitter's bit duration
+HOST = '0.0.0.0'  # Listen on all interfaces
+PORT = 8081       # Port to listen on (matches ConnectScreen)
+
+# Global variable to store connected client
+client_conn = None
+client_lock = threading.Lock()
+
+def read_bit():
+    """Read a single bit from the photocell"""
+    return '1' if GPIO.input(photocell_pin) else '0'
+
+def read_bit_stable():
+    """Read a bit with majority voting to reduce noise"""
+    readings = [read_bit() for _ in range(3)]
+    return '1' if readings.count('1') >= 2 else '0'
+
+def wait_for_start():
+    """Wait for the start bit (1)"""
+    while read_bit() != '1':
+        time.sleep(bit_duration / 4)
+
+def receive_char():
+    """Receive a single character from the photocell"""
+    wait_for_start()
+    bits = ""
+    time.sleep(bit_duration * 1.5)  # Align with bit start
+    for _ in range(8):
+        bit = read_bit_stable()
+        bits += bit
+        time.sleep(bit_duration)
+    time.sleep(bit_duration)  # Stop bit
+    try:
+        char = chr(int(bits, 2))
+        return char if char in string.printable else ''
+    except ValueError:
+        logging.warning("Invalid character bits: %s", bits)
+        return ''
+
+def receive_message():
+    """Receive messages between # and * markers"""
+    buffer = ""
+    base64_buffer = []
+    recording = False
+    is_image = False
+    image_name = None
+
+    while True:
+        char = receive_char()
+        if not char:
+            continue
+        if char == "#":
+            buffer = ""
+            base64_buffer = []
+            recording = True
+            is_image = False
+            image_name = None
+            logging.info("Started recording message")
+  elif char == "*" and recording:
+            recording = False
+            message_str = buffer
+            logging.info(f"Received raw message: {message_str}")
+            print(f"Received raw message: {message_str}")
+            if message_str.startswith('IMAGE:'):
+                image_name = message_str.split(':', 1)[1]
+                is_image = True
+                logging.info(f"Image metadata received: {image_name}")
+                print(f"Image metadata received: {image_name}")
+            elif message_str.startswith('IMG_START:'):
+                base64_buffer.append(message_str.split(':', 1)[1])
+                logging.info("Started receiving image data")
+                print("Started receiving image data")
+            elif message_str.startswith('IMG_CHUNK:'):
+                base64_buffer.append(message_str.split(':', 1)[1])
+                logging.info("Received image chunk")
+                print("Received image chunk")
+            elif message_str.startswith('IMG_END:'):
+                base64_buffer.append(message_str.split(':', 1)[1])
+                logging.info("Finished receiving image data")
+                print("Finished receiving image data")
+                if base64_buffer and image_name:
+                    base64_data = ''.join(base64_buffer)
+                    logging.info(f"Assembled image base64 (length: {len(base64_data)})")
+                    print(f"Assembled image base64 (length: {len(base64_data)})")
+                    try:
+                        send_to_client({
+                            'type': 'received',
+                            'content': base64_data,
+                            'name': image_name,
+                            'timestamp': time.time()
+                        })
+                        logging.info(f"Sent image to client: {image_name}")
+                        print(f"Sent image to client: {image_name}")
+                    except Exception as e:
+                        logging.error(f"Error sending image: {e}")
+                        print(f"Error sending image: {e}")
+                base64_buffer = []
+                is_image = False
+            else:
+                if message_str:
+                    send_to_client({
+                        'type': 'received',
+                        'content': message_str,
+                        'timestamp': time.time()
+                    })
+                    logging.info(f"Sent text to client: {message_str}")
+                    print(f"Sent text to client: {message_str}")
+                else:
+                    logging.warning("Empty text message ignored")
+                    print("Empty text message ignored")
+            buffer = ""
+        elif recording:
+            buffer += char
+
+def send_to_client(message):
+    """Send a message to the connected client"""
+    global client_conn
+    with client_lock:
+        if client_conn is not None:
+            try:
+                logging.info(f"Sending to client: {message}")
+                print(f"Sending to client: {message}")
+                client_conn.sendall((json.dumps(message) + '\n').encode('utf-8'))
+            except socket.error as e:
+                logging.error(f"Error sending to client: {e}")
+                print(f"Error sending to client: {e}")
+                client_conn = None
+
+def handle_client(conn, addr):
+    """Handle client connection"""
+    global client_conn
+    logging.info(f"Connected by {addr}")
+    print(f"Connected by {addr}")
+    with client_lock:
+        client_conn = conn
+    try:
+        send_to_client({
+            'type': 'status',
+            'content': 'Receiving',
+            'timestamp': time.time()
+        })
+        while True:
+            data = conn.recv(4096)
+            if not data:
+                break
+    except socket.error as e:
+        logging.error(f"Socket error with {addr}: {e}")
+        print(f"Socket error with {addr}: {e}")
+    finally:
+        with client_lock:
+            if client_conn == conn:
+                client_conn = None
+        conn.close()
+        logging.info(f"Connection with {addr} closed")
+        print(f"Connection with {addr} closed")
+
+def start_server():
+    """Start the receiver server"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((HOST, PORT))
+            s.listen()
+            logging.info(f"Receiver server listening on {HOST}:{PORT}")
+            print(f"Receiver server listening on {HOST}:{PORT}")
+            while True:
+                conn, addr = s.accept()
+                client_thread = threading.Thread(target=handle_client, args=(conn, addr))
+                client_thread.daemon = True
+                client_thread.start()
+        except socket.error as e:
+            logging.error(f"Server socket error: {e}")
+            print(f"Server socket error: {e}")
+        except KeyboardInterrupt:
+            logging.info("Server shutting down...")
+            print("Server shutting down...")
+        finally:
+            GPIO.cleanup()
+
+def signal_handler(sig, frame):
+    """Handle system signals for graceful shutdown"""
+    logging.info("Received shutdown signal")
+ print("Shutting down...")
+    GPIO.cleanup()
+    sys.exit(0)
+
+if __name__ == "__main__":
+    try:
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        logging.info("LiFi Receiver starting...")
+        print("LiFi Receiver starting...")
+        print("Using GPIO pin", photocell_pin, "for photocell input")
+        receiver_thread = threading.Thread(target=receive_message)
+        receiver_thread.daemon = True
+        receiver_thread.start()
+        start_server()
+    except Exception as e:
+        logging.error(f"Server error: {e}")
+        print(f"Server error: {e}")
+    finally:
+        GPIO.cleanup()
+
