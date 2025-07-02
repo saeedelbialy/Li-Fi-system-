@@ -22,7 +22,7 @@ GPIO.setmode(GPIO.BCM)
 GPIO.setup(photocell_pin, GPIO.IN)
 
 # Communication settings
-bit_duration = 0.006  # Match transmitter's bit duration
+bit_duration = 0.004  # Match transmitter's bit duration
 HOST = '0.0.0.0'  # Listen on all interfaces
 PORT = 8081       # Port to listen on (matches ConnectScreen)
 
