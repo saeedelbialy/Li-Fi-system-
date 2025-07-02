@@ -11,7 +11,7 @@ GPIO.setmode(GPIO.BCM)
 GPIO.setup(laser_pin, GPIO.OUT)
 
 # Communication settings
-bit_duration = 0.006  # Bit duration for better accuracy
+bit_duration = 0.004  # Bit duration for better accuracy
 HOST = '0.0.0.0'  # Listen on all interfaces
 PORT = 8080       # Port to listen on
 
